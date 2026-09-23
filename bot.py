@@ -1,5 +1,4 @@
 import os
-import json
 import time
 import asyncio
 import aiohttp
@@ -11,20 +10,25 @@ from telebot import TeleBot
 from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton, LabeledPrice
 )
+from supabase import create_client, Client
 
 TOKEN = "8904336309:AAHBQM3tBk2Qhl4fB-uYbFqZZJl5mMs4Ks0"
 ADMIN_ID = 341311229
 REQUIRED_CHANNELS = ['@test_my_burger']
-LOG_CHANNEL_ID = None # Можешь указать ID чата/канала для логов ошибок, если нужно
+LOG_CHANNEL_ID = None
 MAX_CYCLES = 10
 COOLDOWN_SECONDS = 60
 
 bot = TeleBot(TOKEN)
 
-# Файлы баз данных
-USERS_DB = "users_db.json"
-WHITELIST_DB = "whitelist_db.json"
-SETTINGS_DB = "settings_db.json"
+# --- ПОДКЛЮЧЕНИЕ К SUPABASE ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("⚠️ ОШИБКА: Не заданы SUPABASE_URL или SUPABASE_KEY в переменных окружения Render!")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
 
 TARGET_URLS = [
     'https://oauth.telegram.org/auth/request?bot_id=1852523856&origin=https%3A%2F%2Fcabinet.presscode.app&embed=1&return_to=https%3A%2F%2Fcabinet.presscode.app%2Flogin',
@@ -45,59 +49,98 @@ TARGET_URLS = [
 stop_flags = {}
 temp_data = {}
 
-# --- НАСТРОЙКИ (ЦЕНЫ) ---
+# --- РАБОТА С НАСТРОЙКАМИ И БАЗОЙ ЧЕРЕЗ SUPABASE ---
 def load_settings():
-    default_settings = {"sub_price": 15, "whitelist_price": 30}
-    if not os.path.exists(SETTINGS_DB):
-        save_settings(default_settings)
-        return default_settings
+    if not supabase:
+        return {"sub_price": 15, "whitelist_price": 30}
     try:
-        with open(SETTINGS_DB, "r", encoding="utf-8") as f:
-            return json.load(f)
+        res = supabase.table("settings").select("key, value").execute()
+        settings = {row["key"]: row["value"] for row in res.data}
+        return {
+            "sub_price": settings.get("sub_price", 15),
+            "whitelist_price": settings.get("whitelist_price", 30)
+        }
     except:
-        return default_settings
+        return {"sub_price": 15, "whitelist_price": 30}
 
-def save_settings(settings):
-    with open(SETTINGS_DB, "w", encoding="utf-8") as f:
-        json.dump(settings, f, ensure_ascii=False, indent=4)
+def save_settings_db(sub_price, whitelist_price):
+    if not supabase:
+        return
+    try:
+        supabase.table("settings").upsert([
+            {"key": "sub_price", "value": sub_price},
+            {"key": "whitelist_price", "value": whitelist_price}
+        ]).execute()
+    except:
+        pass
 
-# --- ЛОГИРОВАНИЕ ОШИБОК ---
 def log_error(user_id, error_text):
     tb = traceback.format_exc()
     full_log = f"❌ Ошибка в боте:\n{error_text}\n\nTraceback:\n{tb}"
     print(full_log)
-    if LOG_CHANNEL_ID:
-        try:
-            bot.send_message(LOG_CHANNEL_ID, f"⚠️ *Ошибка у юзера `{user_id}`*\n```{full_log[:3500]}```", parse_mode='Markdown')
-        except:
-            pass
 
-# --- БАЗЫ ДАННЫХ ---
 def load_db():
-    if not os.path.exists(USERS_DB):
+    if not supabase:
         return {}
     try:
-        with open(USERS_DB, "r", encoding="utf-8") as f:
-            return json.load(f)
+        res = supabase.table("users").select("*").execute()
+        db = {}
+        for row in res.data:
+            db[str(row["user_id"])] = {
+                "id": row["user_id"],
+                "first_name": row.get("first_name"),
+                "username": row.get("username"),
+                "has_access": row.get("has_access", False),
+                "stars_spent": row.get("stars_spent", 0),
+                "total_orders": row.get("total_orders", 0),
+                "referrals_count": row.get("referrals_count", 0),
+                "last_order_time": row.get("last_order_time")
+            }
+        return db
     except:
         return {}
 
-def save_db(db):
-    with open(USERS_DB, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=4)
+def save_user_to_db(user_id, data):
+    if not supabase:
+        return
+    try:
+        supabase.table("users").upsert({
+            "user_id": int(user_id),
+            "first_name": data.get("first_name"),
+            "username": data.get("username"),
+            "has_access": data.get("has_access", False),
+            "stars_spent": data.get("stars_spent", 0),
+            "total_orders": data.get("total_orders", 0),
+            "referrals_count": data.get("referrals_count", 0),
+            "last_order_time": data.get("last_order_time")
+        }).execute()
+    except Exception as e:
+        print(f"Ошибка сохранения юзера в Supabase: {e}")
 
 def load_whitelist():
-    if not os.path.exists(WHITELIST_DB):
+    if not supabase:
         return []
     try:
-        with open(WHITELIST_DB, "r", encoding="utf-8") as f:
-            return json.load(f)
+        res = supabase.table("whitelist").select("phone").execute()
+        return [row["phone"] for row in res.data]
     except:
         return []
 
-def save_whitelist(wl):
-    with open(WHITELIST_DB, "w", encoding="utf-8") as f:
-        json.dump(wl, f, ensure_ascii=False, indent=4)
+def add_to_whitelist_db(phone):
+    if not supabase:
+        return
+    try:
+        supabase.table("whitelist").upsert({"phone": phone}).execute()
+    except:
+        pass
+
+def remove_from_whitelist_db(phone):
+    if not supabase:
+        return
+    try:
+        supabase.table("whitelist").delete().eq("phone", phone).execute()
+    except:
+        pass
 
 def is_phone_protected(phone):
     wl = load_whitelist()
@@ -107,7 +150,8 @@ def ensure_user_record(user_id, from_user=None):
     db = load_db()
     uid_str = str(user_id)
     if uid_str not in db:
-        db[uid_str] = {
+        user_data = {
+            "id": user_id,
             "first_name": from_user.first_name if from_user else "Unknown",
             "username": from_user.username if from_user else None,
             "has_access": False,
@@ -116,7 +160,8 @@ def ensure_user_record(user_id, from_user=None):
             "referrals_count": 0,
             "last_order_time": None
         }
-        save_db(db)
+        save_user_to_db(user_id, user_data)
+        return user_data
     return db[uid_str]
 
 # --- ПРОВЕРКА ПОДПИСКИ ---
@@ -266,7 +311,6 @@ def show_admin_panel(chat_id, message_id=None):
     markup.add(InlineKeyboardButton("🛡 Добавить в Вайт-лист", callback_data='adm_add_wl'))
     markup.add(InlineKeyboardButton("🗑 Удалить из Вайт-листа", callback_data='adm_del_wl'))
     markup.add(InlineKeyboardButton("💵 Изменить цены", callback_data='adm_change_prices'))
-    markup.add(InlineKeyboardButton("📥 Скачать бэкап баз", callback_data='adm_download_backup'))
     markup.add(InlineKeyboardButton("🔙 Главное меню", callback_data='back_to_menu'))
 
     if message_id:
@@ -289,17 +333,19 @@ def adm_process_sub_action(message, action):
 
     db = load_db()
     uid_str = str(target_id)
-    if uid_str not in db:
-        db[uid_str] = {"has_access": False, "stars_spent": 0, "total_orders": 0}
+    if uid_str in db:
+        user_data = db[uid_str]
+    else:
+        user_data = {"id": target_id, "has_access": False, "stars_spent": 0, "total_orders": 0}
 
     if action == "give":
-        db[uid_str]["has_access"] = True
+        user_data["has_access"] = True
         bot.send_message(message.chat.id, f"✅ Подписка успешно выдана юзеру `{target_id}`!", parse_mode='Markdown')
     else:
-        db[uid_str]["has_access"] = False
+        user_data["has_access"] = False
         bot.send_message(message.chat.id, f"❌ Подписка забрана у юзера `{target_id}`!", parse_mode='Markdown')
     
-    save_db(db)
+    save_user_to_db(target_id, user_data)
     show_admin_panel(message.chat.id)
 
 def adm_ask_phone_for_wl(message, action):
@@ -314,16 +360,11 @@ def adm_process_wl_action(message, action):
         show_admin_panel(message.chat.id)
         return
 
-    wl = load_whitelist()
     if action == "add":
-        if phone not in wl:
-            wl.append(phone)
-            save_whitelist(wl)
+        add_to_whitelist_db(phone)
         bot.send_message(message.chat.id, f"🛡 Номер `{phone}` добавлен в Вайт-лист.", parse_mode='Markdown')
     else:
-        if phone in wl:
-            wl.remove(phone)
-            save_whitelist(wl)
+        remove_from_whitelist_db(phone)
         bot.send_message(message.chat.id, f"🗑 Номер `{phone}` удален из Вайт-листа.", parse_mode='Markdown')
     
     show_admin_panel(message.chat.id)
@@ -333,10 +374,7 @@ def adm_ask_new_prices(message):
         parts = message.text.split()
         sub_p = int(parts[0])
         wl_p = int(parts[1])
-        settings = load_settings()
-        settings["sub_price"] = sub_p
-        settings["whitelist_price"] = wl_p
-        save_settings(settings)
+        save_settings_db(sub_p, wl_p)
         bot.send_message(message.chat.id, f"✅ Цены обновлены!\nПодписка: {sub_p} ⭐\nВайт-лист: {wl_p} ⭐")
     except:
         bot.send_message(message.chat.id, "❌ Ошибка. Введите два числа через пробел, например: `15 30`", parse_mode='Markdown')
@@ -363,31 +401,28 @@ def pre_checkout_query(query):
 @bot.message_handler(content_types=['successful_payment'])
 def successful_payment(message):
     payload = message.successful_payment.invoice_payload
-    uid_str = str(message.chat.id)
+    user_id = message.from_user.id
     db = load_db()
+    uid_str = str(user_id)
+    user_data = db.get(uid_str, {"id": user_id, "has_access": False, "stars_spent": 0, "total_orders": 0})
 
     if payload == "unlimited_access":
-        if uid_str in db:
-            db[uid_str]["has_access"] = True
-            db[uid_str]["stars_spent"] = db[uid_str].get("stars_spent", 0) + 15
-            save_db(db)
+        user_data["has_access"] = True
+        user_data["stars_spent"] = user_data.get("stars_spent", 0) + 15
+        save_user_to_db(user_id, user_data)
 
         bot.send_message(message.chat.id, "✅ *Оплата прошла успешно! Доступ навсегда разблокирован!*", parse_mode='Markdown')
-        show_main_menu(message.chat.id, message.from_user.id)
+        show_main_menu(message.chat.id, user_id)
 
     elif payload.startswith("whitelist_"):
         phone_to_add = payload.replace("whitelist_", "")
-        whitelist = load_whitelist()
-        if phone_to_add not in whitelist:
-            whitelist.append(phone_to_add)
-            save_whitelist(whitelist)
+        add_to_whitelist_db(phone_to_add)
 
-        if uid_str in db:
-            db[uid_str]["stars_spent"] = db[uid_str].get("stars_spent", 0) + 30
-            save_db(db)
+        user_data["stars_spent"] = user_data.get("stars_spent", 0) + 30
+        save_user_to_db(user_id, user_data)
 
         bot.send_message(message.chat.id, f"🛡 *Номер `{phone_to_add}` успешно добавлен в защищенный Вайт-лист!*", parse_mode='Markdown')
-        show_main_menu(message.chat.id, message.from_user.id)
+        show_main_menu(message.chat.id, user_id)
 
 def process_whitelist_input(message):
     phone = format_and_validate_phone(message.text)
@@ -449,9 +484,10 @@ def process_cycles(message, phone):
         bot.register_next_step_handler(message, process_cycles, phone)
         return
 
+    user_id = message.from_user.id
     db = load_db()
-    uid_str = str(message.from_user.id)
-    user_data = db.get(uid_str, {})
+    uid_str = str(user_id)
+    user_data = db.get(uid_str, {"id": user_id, "has_access": False, "stars_spent": 0, "total_orders": 0})
     last_order = user_data.get("last_order_time")
 
     if last_order and not user_data.get("has_access"):
@@ -460,13 +496,12 @@ def process_cycles(message, phone):
         if delta < COOLDOWN_SECONDS:
             remaining = int(COOLDOWN_SECONDS - delta)
             bot.send_message(message.chat.id, f"⏳ Кулдаун! Подождите `{remaining}` секунд.", parse_mode='Markdown')
-            show_main_menu(message.chat.id, message.from_user.id)
+            show_main_menu(message.chat.id, user_id)
             return
 
-    if uid_str in db:
-        db[uid_str]["last_order_time"] = datetime.utcnow().isoformat()
-        db[uid_str]["total_orders"] = db[uid_str].get("total_orders", 0) + 1
-        save_db(db)
+    user_data["last_order_time"] = datetime.utcnow().isoformat()
+    user_data["total_orders"] = user_data.get("total_orders", 0) + 1
+    save_user_to_db(user_id, user_data)
 
     stop_flags[message.chat.id] = False
     markup = InlineKeyboardMarkup()
@@ -564,12 +599,6 @@ def callback_handler(call):
         elif data == 'adm_change_prices' and user_id == ADMIN_ID:
             msg = bot.send_message(chat_id, "💵 Введите новые цены через пробел (`[подписка]` `[вайтлист]`):", parse_mode='Markdown')
             bot.register_next_step_handler(msg, adm_ask_new_prices)
-        elif data == 'adm_download_backup' and user_id == ADMIN_ID:
-            bot.answer_callback_query(call.id, "Отправка файлов...")
-            for fn in [USERS_DB, WHITELIST_DB, SETTINGS_DB]:
-                if os.path.exists(fn):
-                    with open(fn, "rb") as f:
-                        bot.send_document(chat_id, f, caption=f"📁 Бэкап: {fn}")
 
         elif data == 'confirm_phone':
             phone = temp_data.get(chat_id)
@@ -585,5 +614,5 @@ def callback_handler(call):
         log_error(call.from_user.id, str(e))
 
 if __name__ == '__main__':
-    print("Бот запущен и готов к работе!")
+    print("Бот запущен с поддержкой Supabase!")
     bot.infinity_polling(skip_pending=True)
