@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import asyncio
 import aiohttp
@@ -49,6 +50,86 @@ TARGET_URLS = [
 stop_flags = {}
 temp_data = {}
 
+def save_settings_db(sub_price, whitelist_price):
+    if not supabase:
+        return
+    try:
+        supabase.table("settings").upsert([
+            {"key": "sub_price", "value": sub_price},
+            {"key": "whitelist_price", "value": whitelist_price}
+        ]).execute()
+    except:
+        pass
+
+def save_user_to_db(user_id, data):
+    if not supabase:
+        return
+    try:
+        supabase.table("users").upsert({
+            "user_id": int(user_id),
+            "first_name": data.get("first_name"),
+            "username": data.get("username"),
+            "has_access": data.get("has_access", False),
+            "stars_spent": data.get("stars_spent", 0),
+            "total_orders": data.get("total_orders", 0),
+            "referrals_count": data.get("referrals_count", 0),
+            "last_order_time": data.get("last_order_time")
+        }).execute()
+    except Exception as e:
+        print(f"Ошибка сохранения юзера в Supabase: {e}")
+
+def add_to_whitelist_db(phone):
+    if not supabase:
+        return
+    try:
+        supabase.table("whitelist").upsert({"phone": phone}).execute()
+    except:
+        pass
+
+# --- АВТОМАТИЧЕСКИЙ ПЕРЕНОС ДАННЫХ ИЗ JSON В SUPABASE ---
+def migrate_json_to_supabase():
+    if not supabase:
+        return
+    print("🔄 Проверка и перенос старых данных из JSON в Supabase...")
+    
+    # 1. Перенос настроек
+    if os.path.exists("settings_db.json"):
+        try:
+            with open("settings_db.json", "r", encoding="utf-8") as f:
+                s = json.load(f)
+                save_settings_db(s.get("sub_price", 15), s.get("whitelist_price", 30))
+        except: pass
+        
+    # 2. Перенос вайт-листа
+    if os.path.exists("whitelist_db.json"):
+        try:
+            with open("whitelist_db.json", "r", encoding="utf-8") as f:
+                wl = json.load(f)
+                for phone in wl:
+                    add_to_whitelist_db(phone)
+        except: pass
+        
+    # 3. Перенос пользователей
+    if os.path.exists("users_db.json"):
+        try:
+            with open("users_db.json", "r", encoding="utf-8") as f:
+                users = json.load(f)
+                for uid_str, udata in users.items():
+                    user_id = udata.get("id") or int(uid_str)
+                    save_user_to_db(user_id, {
+                        "id": user_id,
+                        "first_name": udata.get("first_name"),
+                        "username": udata.get("username"),
+                        "has_access": udata.get("has_access", False),
+                        "stars_spent": udata.get("stars_spent", 0),
+                        "total_orders": udata.get("total_orders", 0),
+                        "referrals_count": udata.get("referrals_count", 0),
+                        "last_order_time": udata.get("last_order_time")
+                    })
+            print("✅ Данные из JSON успешно импортированы в Supabase!")
+        except Exception as e:
+            print(f"⚠️ Ошибка миграции пользователей: {e}")
+
 # --- РАБОТА С НАСТРОЙКАМИ И БАЗОЙ ЧЕРЕЗ SUPABASE ---
 def load_settings():
     if not supabase:
@@ -62,17 +143,6 @@ def load_settings():
         }
     except:
         return {"sub_price": 15, "whitelist_price": 30}
-
-def save_settings_db(sub_price, whitelist_price):
-    if not supabase:
-        return
-    try:
-        supabase.table("settings").upsert([
-            {"key": "sub_price", "value": sub_price},
-            {"key": "whitelist_price", "value": whitelist_price}
-        ]).execute()
-    except:
-        pass
 
 def log_error(user_id, error_text):
     tb = traceback.format_exc()
@@ -100,23 +170,6 @@ def load_db():
     except:
         return {}
 
-def save_user_to_db(user_id, data):
-    if not supabase:
-        return
-    try:
-        supabase.table("users").upsert({
-            "user_id": int(user_id),
-            "first_name": data.get("first_name"),
-            "username": data.get("username"),
-            "has_access": data.get("has_access", False),
-            "stars_spent": data.get("stars_spent", 0),
-            "total_orders": data.get("total_orders", 0),
-            "referrals_count": data.get("referrals_count", 0),
-            "last_order_time": data.get("last_order_time")
-        }).execute()
-    except Exception as e:
-        print(f"Ошибка сохранения юзера в Supabase: {e}")
-
 def load_whitelist():
     if not supabase:
         return []
@@ -125,14 +178,6 @@ def load_whitelist():
         return [row["phone"] for row in res.data]
     except:
         return []
-
-def add_to_whitelist_db(phone):
-    if not supabase:
-        return
-    try:
-        supabase.table("whitelist").upsert({"phone": phone}).execute()
-    except:
-        pass
 
 def remove_from_whitelist_db(phone):
     if not supabase:
@@ -374,6 +419,7 @@ def adm_ask_new_prices(message):
         parts = message.text.split()
         sub_p = int(parts[0])
         wl_p = int(parts[1])
+        settings = load_settings()
         save_settings_db(sub_p, wl_p)
         bot.send_message(message.chat.id, f"✅ Цены обновлены!\nПодписка: {sub_p} ⭐\nВайт-лист: {wl_p} ⭐")
     except:
@@ -614,5 +660,8 @@ def callback_handler(call):
         log_error(call.from_user.id, str(e))
 
 if __name__ == '__main__':
-    print("Бот запущен с поддержкой Supabase!")
+    # При старте автоматически заливаем старые JSON-данные в Supabase (если они есть)
+    migrate_json_to_supabase()
+    
+    print("Бот запущен с поддержкой Supabase и автомиграцией!")
     bot.infinity_polling(skip_pending=True)
